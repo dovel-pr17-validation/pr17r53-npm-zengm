@@ -1,0 +1,251 @@
+import clsx from "clsx";
+import { MoreLinks } from "../components/MoreLinks.tsx";
+import useTitleBar from "../hooks/useTitleBar.tsx";
+import { helpers } from "../util/helpers.ts";
+import useClickable from "../hooks/useClickable.tsx";
+import type { View, Game } from "../../common/types.ts";
+import { bySport } from "../../common/sportFunctions.ts";
+import getWinner from "../../common/getWinner.ts";
+import formatScoreWithShootout from "../../common/formatScoreWithShootout.ts";
+import { BoxScoreWrapper } from "../components/BoxScoreWrapper.tsx";
+import { BoxScoreRow } from "../components/BoxScoreRow.tsx";
+import { useLocal } from "../util/local.ts";
+
+const StatsRow = ({
+	p,
+	...props
+}: {
+	i: number;
+	p: unknown;
+	season: number;
+}) => {
+	const { clicked, toggleClicked } = useClickable();
+
+	const classes = clsx({
+		"table-warning": clicked,
+	});
+	return (
+		<BoxScoreRow className={classes} onClick={toggleClicked} p={p} {...props} />
+	);
+};
+
+const findPrevNextGids = (games: Game[], currentGid: number) => {
+	let prevGid;
+	let nextGid;
+	let currentGidInList = false;
+
+	for (const [i, game] of games.entries()) {
+		if (game.gid === currentGid) {
+			currentGidInList = true;
+			nextGid = games[i - 1]?.gid;
+			prevGid = games[i + 1]?.gid;
+			break;
+		}
+	}
+
+	return { currentGidInList, prevGid, nextGid };
+};
+
+export const NoGamesMessage = ({
+	warnAboutDelete,
+}: {
+	warnAboutDelete: boolean;
+}) => (
+	<div className="alert alert-info d-inline-block" style={{ maxWidth: 600 }}>
+		No games found for this season.
+		{warnAboutDelete ? (
+			<>
+				{" "}
+				By default, box scores from old seasons are automatically deleted after
+				2 seasons. You can edit this behavior with the{" "}
+				<a href={helpers.leagueUrl(["settings"])}>
+					Save Old Box Scores setting on the League Settings page
+				</a>
+				.
+			</>
+		) : null}
+	</div>
+);
+
+const GamesList = ({
+	currentSeason,
+	gid,
+	gamesList,
+	season,
+	team,
+	tid,
+}: {
+	currentSeason: number;
+	gamesList: View<"gameLog">["gamesList"];
+	gid?: number;
+	season: number;
+	team: View<"gameLog">["team"];
+	tid: number;
+}) => {
+	if (season < currentSeason && gamesList.games.length === 0) {
+		return <NoGamesMessage warnAboutDelete />;
+	}
+
+	return (
+		<table className="table table-striped table-borderless table-sm game-log-list">
+			<thead>
+				<tr>
+					<th>Opp</th>
+					<th>W/L</th>
+					<th>Score</th>
+				</tr>
+			</thead>
+			<tbody>
+				{gamesList.tid !== tid ? (
+					<tr>
+						<td colSpan={3}>Loading...</td>
+					</tr>
+				) : (
+					gamesList.games.map((gm) => {
+						const home = gm.teams[0].tid === tid;
+						const user = home ? 0 : 1;
+						const other = home ? 1 : 0;
+
+						const winner = getWinner(gm.teams);
+						const result = winner === user ? "W" : winner === other ? "L" : "T";
+
+						const overtimeText = helpers.overtimeText(
+							gm.overtimes,
+							gm.numPeriods,
+						);
+						const overtimes =
+							overtimeText === ""
+								? ""
+								: __SPORT === "baseball"
+									? ` (${overtimeText})`
+									: ` ${overtimeText}`;
+
+						const oppAbbrev = gamesList.abbrevs[gm.teams[other].tid];
+
+						const url = helpers.leagueUrl([
+							"game_log",
+							team === "special" ? team : helpers.getTeamUrlPart(team),
+							season,
+							gm.gid,
+						]);
+
+						return (
+							<tr
+								key={gm.gid}
+								className={gm.gid === gid ? "table-info" : undefined}
+							>
+								<td className="game-log-cell">
+									<a href={url} data-no-scroll-reset>
+										{gm.neutralSite || home ? "" : "@"}
+										{oppAbbrev}
+									</a>
+								</td>
+								<td className={clsx("game-log-cell")}>
+									<a
+										href={url}
+										data-no-scroll-reset
+										className={
+											gm.forceWin !== undefined ? "alert-god-mode" : undefined
+										}
+									>
+										{result}
+									</a>
+								</td>
+								<td className="game-log-cell">
+									<a href={url} data-no-scroll-reset>
+										{formatScoreWithShootout(gm.teams[user], gm.teams[other])}
+										{overtimes}
+									</a>
+								</td>
+							</tr>
+						);
+					})
+				)}
+			</tbody>
+		</table>
+	);
+};
+
+const GameLog = ({
+	boxScore,
+	gamesList,
+	season,
+	team,
+	tid,
+}: View<"gameLog">) => {
+	useTitleBar({
+		title: "Game Log",
+		dropdown: {
+			fields: [
+				{
+					key: "team",
+					options: {
+						type: "teams",
+						allStarGame: bySport({ basketball: true, default: false }),
+					},
+					value: team,
+				},
+				{ key: "season", options: { type: "seasons" }, value: season },
+			],
+			view: "gameLog",
+			params: { gid: boxScore.gid },
+		},
+	});
+
+	const { season: currentSeason } = useLocal(["season"]);
+
+	const { currentGidInList, nextGid, prevGid } = findPrevNextGids(
+		gamesList.games,
+		boxScore.gid,
+	);
+
+	const noGamesAndNoBoxScore =
+		season < currentSeason && gamesList.games.length === 0 && boxScore.gid < 0;
+
+	return (
+		<>
+			{tid >= 0 ? (
+				<MoreLinks type="team" page="game_log" tid={tid} season={season} />
+			) : null}
+
+			{noGamesAndNoBoxScore ? (
+				<NoGamesMessage warnAboutDelete />
+			) : (
+				<>
+					<p />
+					<div className="row">
+						<div className="col-md-10">
+							{boxScore.gid >= 0 ? (
+								<BoxScoreWrapper
+									boxScore={boxScore}
+									currentGidInList={currentGidInList}
+									nextGid={nextGid}
+									prevGid={prevGid}
+									showNextPrev
+									sportState={undefined}
+									tid={tid}
+									Row={StatsRow}
+								/>
+							) : (
+								<p>Select a game from the menu to view a box score.</p>
+							)}
+						</div>
+
+						<div className="col-md-2 mt-3 mt-md-0">
+							<GamesList
+								currentSeason={currentSeason}
+								gamesList={gamesList}
+								gid={boxScore.gid}
+								season={season}
+								team={team}
+								tid={tid}
+							/>
+						</div>
+					</div>
+				</>
+			)}
+		</>
+	);
+};
+
+export default GameLog;

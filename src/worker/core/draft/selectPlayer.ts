@@ -1,0 +1,230 @@
+import { PHASE } from "../../../common/constants.ts";
+import { player, league, team } from "../index.ts";
+import getRookieSalaries from "./getRookieSalaries.ts";
+import { idb } from "../../db/index.ts";
+import { g, helpers, local, logEvent } from "../../util/index.ts";
+import type { DraftPick, FlatContractInfo } from "../../../common/types.ts";
+import { addContract, createContract } from "../contract/index.ts";
+import getRookieContractLength from "./getRookieContractLength.ts";
+import { last } from "../../../common/utils.ts";
+import { canBeDrafted } from "./canBeDrafted.ts";
+
+/**
+ * Select a player for the current drafting team.
+ *
+ * This can be called in response to the user clicking the "draft" button for a player, or by some other function like untilUserOrEnd.
+ *
+ * @memberOf core.draft
+ * @param {object} dp Pick object, like from getOrder, that contains information like the team, round, etc.
+ * @param {number} pid Integer player ID for the player to be drafted.
+ * @return {Promise<boolean>} false if the player is not available to be drafted, like if the user double clicked on a player who was already picked.
+ */
+const selectPlayer = async (dp: DraftPick, pid: number) => {
+	if (dp.pick <= 0) {
+		console.log(dp);
+		throw new Error(`Invalid draft pick number "${dp.pick}"`);
+	}
+
+	const p = await idb.cache.players.get(pid);
+	if (!p) {
+		throw new Error("Invalid pid");
+	}
+	if (!canBeDrafted(p)) {
+		return false;
+	}
+	const prevTid = p.tid;
+	p.tid = dp.tid;
+
+	const expansionDraft = g.get("expansionDraft");
+
+	const fantasyOrExpansionDraft =
+		g.get("phase") === PHASE.FANTASY_DRAFT || expansionDraft.phase === "draft";
+
+	if (fantasyOrExpansionDraft) {
+		const fakeP = {
+			...helpers.deepCopy(p),
+
+			// These are only used for expansion draft UI, not fantasy draft
+			prevTid,
+			prevAbbrev: g.get("teamInfoCache")[prevTid]?.abbrev,
+		};
+
+		const { ovr, pot, skills } = last(p.ratings);
+
+		fakeP.draft = {
+			round: dp.round,
+			pick: dp.pick,
+			tid: dp.tid,
+			year: g.get("season"),
+			originalTid: dp.originalTid,
+			pot,
+			ovr,
+			skills,
+			dpid: dp.dpid,
+		};
+		local.fantasyDraftResults.push(fakeP);
+	} else {
+		p.draft = {
+			round: dp.round,
+			pick: dp.pick,
+			tid: dp.tid,
+			year: g.get("season"),
+			originalTid: dp.originalTid,
+			pot: p.ratings[0].pot,
+			ovr: p.ratings[0].ovr,
+			skills: p.ratings[0].skills,
+			dpid: dp.dpid,
+		};
+	}
+
+	// Contract
+	if (fantasyOrExpansionDraft) {
+		// Players who were free agents before a fantasy draft sign their contract demand. Everyone else keeps his contract.
+		if (p.contractDemand) {
+			addContract(
+				p,
+				createContract({
+					contract: p.contractDemand,
+					type: "unknown",
+				}),
+			);
+		}
+	} else {
+		if (!g.get("draftPickAutoContract")) {
+			// No contract yet, just an expiring contract demand, so he will have to sign a contract in the re-signing phase
+			player.setContractDemand(p, {
+				amount: g.get("minContract"),
+				exp: g.get("season"),
+			});
+		} else {
+			const rookieSalaries = getRookieSalaries();
+			const i = dp.pick - 1 + g.get("numActiveTeams") * (dp.round - 1);
+
+			const contractDemand: FlatContractInfo = {
+				// The rookie scale only covers numDraftRounds full rounds, but some drafts have more picks, like real drafts with extra rounds or picks. The end of the scale is the min contract anyway.
+				amount: rookieSalaries[i] ?? g.get("minContract"),
+				exp: g.get("season"),
+				rookie: true,
+			};
+
+			if (g.get("salaryCapType") === "hard") {
+				// In a hard cap, he will have to sign a contract in the re-signing phase, in case it would go over the cap
+				player.setContractDemand(p, contractDemand);
+			} else {
+				// Auto sign in soft/no cap
+				contractDemand.exp += getRookieContractLength(dp.round);
+				addContract(
+					p,
+					createContract({
+						contract: contractDemand,
+						type: "rookie",
+					}),
+				);
+			}
+		}
+	}
+
+	// Add stats row if necessary (fantasy draft in ongoing season)
+	const nextPhase = g.get("nextPhase");
+	if (
+		g.get("phase") === PHASE.FANTASY_DRAFT &&
+		nextPhase !== undefined &&
+		nextPhase <= PHASE.PLAYOFFS
+	) {
+		player.setJerseyNumber(p, await player.genJerseyNumber(p));
+	}
+
+	const pickNum =
+		dp.pick +
+		(dp.round - 1) *
+			(g.get("phase") === PHASE.EXPANSION_DRAFT &&
+			expansionDraft.phase === "draft"
+				? expansionDraft.expansionTids.length
+				: g.get("numActiveTeams"));
+	const draftName =
+		g.get("phase") === PHASE.FANTASY_DRAFT
+			? `${g.get("season")} fantasy draft`
+			: g.get("phase") === PHASE.EXPANSION_DRAFT
+				? `${g.get("season")} expansion draft`
+				: `<a href="${helpers.leagueUrl([
+						"draft_history",
+						g.get("season"),
+					])}">${g.get("season")} draft</a>`;
+
+	if (!p.transactions) {
+		p.transactions = [];
+	}
+	p.transactions.push({
+		season: g.get("season"),
+		phase: g.get("phase"),
+		tid: p.tid,
+		type: "draft",
+		pickNum,
+	});
+
+	await idb.cache.players.put(p);
+	await idb.cache.draftPicks.delete(dp.dpid);
+
+	let score = 0;
+	if (pickNum === 1) {
+		score = 20;
+	} else if (pickNum <= 5) {
+		score = 10;
+	}
+
+	const eventTids = [p.tid];
+
+	if (
+		g.get("phase") === PHASE.EXPANSION_DRAFT &&
+		expansionDraft.phase === "draft"
+	) {
+		const numDraftedByThisTeam =
+			expansionDraft.numPerTeamDrafted?.[prevTid] !== undefined
+				? expansionDraft.numPerTeamDrafted[prevTid] + 1
+				: 1;
+
+		await league.setGameAttributes({
+			expansionDraft: {
+				...expansionDraft,
+				numPerTeamDrafted: {
+					...expansionDraft.numPerTeamDrafted,
+					[prevTid]: numDraftedByThisTeam,
+				},
+				availablePids: expansionDraft.availablePids.filter(
+					(pid2) => pid !== pid2,
+				),
+			},
+		});
+
+		eventTids.push(prevTid);
+	}
+
+	logEvent({
+		type: "draft",
+		text: `The <a href="${helpers.leagueUrl([
+			"roster",
+			`${g.get("teamInfoCache")[dp.tid]?.abbrev}_${dp.tid}`,
+			g.get("season"),
+		])}">${
+			g.get("teamInfoCache")[dp.tid]?.name
+		}</a> selected <a href="${helpers.leagueUrl(["player", p.pid])}">${
+			p.firstName
+		} ${p.lastName}</a> with the ${helpers.ordinal(
+			pickNum,
+		)} pick in the ${draftName}.`,
+		showNotification: false,
+		pids: [p.pid],
+		tids: eventTids,
+		score,
+	});
+
+	if (g.get("userTids").includes(dp.tid) && !g.get("spectator")) {
+		const t = await idb.cache.teams.get(dp.tid);
+		const onlyNewPlayers = t ? !t.keepRosterSorted : false;
+		await team.rosterAutoSort(dp.tid, onlyNewPlayers);
+	}
+
+	return true;
+};
+
+export default selectPlayer;
